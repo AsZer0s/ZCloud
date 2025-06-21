@@ -331,11 +331,13 @@ app.put('/api/wechat-accounts/:id/status', userAuth, (req, res) => {
     params.push(qr_code_url);
   }
   
-  params.push(req.params.id, req.user.id);
+  params.push(new Date().toISOString()); // for updated_at
+  params.push(req.params.id);
+  params.push(req.user.id);
   
   db.run(
     `UPDATE wechat_accounts SET ${updates.join(', ')}, updated_at = ? WHERE id = ? AND user_id = ?`,
-    [...params, new Date().toISOString()],
+    params,
     function(err) {
       if (err) {
         console.error('更新微信账号状态失败:', err.message);
@@ -348,6 +350,130 @@ app.put('/api/wechat-accounts/:id/status', userAuth, (req, res) => {
     }
   );
 });
+
+// 微信扫码登录 - 请求获取二维码
+app.post('/api/wechat/wakeup-login', userAuth, async (req, res) => {
+  const { auth_key } = req.body;
+  const userId = req.user.id;
+
+  if (!auth_key) {
+    return res.status(400).json({ error: '缺少 auth_key 参数' });
+  }
+
+  try {
+    // 1. 验证 auth_key 是否属于当前用户并且存在
+    const account = await db.get(
+      'SELECT id FROM wechat_accounts WHERE auth_key = ? AND user_id = ?',
+      [auth_key, userId]
+    );
+
+    if (!account) {
+      return res.status(404).json({ error: '无效的 auth_key 或微信账号不存在' });
+    }
+
+    // 2. 模拟从微信API获取二维码
+    // In a real scenario, this would involve an API call to WeChat.
+    // For now, we'll generate a placeholder URL and set status to 'scanning'.
+    const simulatedQrCodeUrl = `https://example.com/qr/${uuidv4()}.png`; // Placeholder QR code
+    const newStatus = 'scanning';
+
+    // 3. 更新数据库中的 qr_code_url 和 status
+    await db.run(
+      'UPDATE wechat_accounts SET qr_code_url = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE auth_key = ? AND user_id = ?',
+      [simulatedQrCodeUrl, newStatus, auth_key, userId]
+    );
+
+    console.log(`Wakeup login initiated for auth_key: ${auth_key}, QR URL: ${simulatedQrCodeUrl}`);
+    res.json({
+      message: '请扫描二维码登录',
+      qr_code_url: simulatedQrCodeUrl,
+      auth_key: auth_key,
+      status: newStatus
+    });
+
+  } catch (error) {
+    console.error('微信扫码登录失败:', error);
+    res.status(500).json({ error: '微信扫码登录失败: ' + error.message });
+  }
+});
+
+// Simulate user scanning the QR code
+app.post('/api/wechat/simulate-scan/:auth_key', userAuth, async (req, res) => {
+  const { auth_key } = req.params;
+  const userId = req.user.id;
+  const newStatus = 'scanned_confirming';
+
+  try {
+    const account = await db.get(
+      'SELECT id, status FROM wechat_accounts WHERE auth_key = ? AND user_id = ?',
+      [auth_key, userId]
+    );
+
+    if (!account) {
+      return res.status(404).json({ error: '微信账号不存在' });
+    }
+
+    if (account.status !== 'scanning') {
+      return res.status(400).json({ error: `微信账号状态为 ${account.status}, 不能模拟扫描. 必须为 'scanning'.` });
+    }
+
+    await db.run(
+      'UPDATE wechat_accounts SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE auth_key = ? AND user_id = ?',
+      [newStatus, auth_key, userId]
+    );
+
+    console.log(`Simulated scan for auth_key: ${auth_key}, status changed to ${newStatus}`);
+    res.json({ message: '模拟扫描成功, 等待用户确认', auth_key, status: newStatus });
+  } catch (error) {
+    console.error('模拟扫描失败:', error);
+    res.status(500).json({ error: '模拟扫描失败: ' + error.message });
+  }
+});
+
+// Simulate user confirming login on phone
+app.post('/api/wechat/simulate-confirm/:auth_key', userAuth, async (req, res) => {
+  const { auth_key } = req.params;
+  const { success } = req.body; // success: boolean
+  const userId = req.user.id;
+  const newStatus = success ? 'online' : 'failed';
+
+  try {
+    const account = await db.get(
+      'SELECT id, status FROM wechat_accounts WHERE auth_key = ? AND user_id = ?',
+      [auth_key, userId]
+    );
+
+    if (!account) {
+      return res.status(404).json({ error: '微信账号不存在' });
+    }
+
+    if (account.status !== 'scanned_confirming') {
+      return res.status(400).json({ error: `微信账号状态为 ${account.status}, 不能模拟确认. 必须为 'scanned_confirming'.` });
+    }
+
+    let updateQuery;
+    const queryParams = [];
+
+    if (success) {
+      const simulatedDeviceAuthKey = `sim_dak_${uuidv4()}`; // Simulated device_auth_key
+      updateQuery = 'UPDATE wechat_accounts SET status = ?, last_login = CURRENT_TIMESTAMP, device_auth_key = ?, updated_at = CURRENT_TIMESTAMP WHERE auth_key = ? AND user_id = ?';
+      queryParams.push(newStatus, simulatedDeviceAuthKey, auth_key, userId);
+      console.log(`Simulated confirm for auth_key: ${auth_key}, success: ${success}, status changed to ${newStatus}, device_auth_key: ${simulatedDeviceAuthKey}`);
+      res.json({ message: `模拟确认成功, 状态: ${newStatus}`, auth_key, status: newStatus, device_auth_key: simulatedDeviceAuthKey });
+    } else {
+      updateQuery = 'UPDATE wechat_accounts SET status = ?, device_auth_key = NULL, updated_at = CURRENT_TIMESTAMP WHERE auth_key = ? AND user_id = ?'; // Clear device_auth_key on failure
+      queryParams.push(newStatus, auth_key, userId);
+      console.log(`Simulated confirm for auth_key: ${auth_key}, success: ${success}, status changed to ${newStatus}`);
+      res.json({ message: `模拟确认成功, 状态: ${newStatus}`, auth_key, status: newStatus });
+    }
+
+    await db.run(updateQuery, queryParams);
+  } catch (error) {
+    console.error('模拟确认失败:', error);
+    res.status(500).json({ error: '模拟确认失败: ' + error.message });
+  }
+});
+
 
 // 创建微信账号（普通用户）
 app.post('/api/wechat-accounts', userAuth, (req, res) => {
@@ -560,7 +686,7 @@ db.run(`CREATE TABLE IF NOT EXISTS wechat_accounts (
   nickname TEXT,
   username TEXT,
   avatar TEXT,
-  status TEXT DEFAULT 'waiting' CHECK(status IN ('online', 'offline', 'waiting', 'scanning')),
+  status TEXT DEFAULT 'waiting',
   last_login DATETIME,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
